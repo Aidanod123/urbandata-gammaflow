@@ -7,7 +7,7 @@ to learn the normal evolution patterns of background radiation.
 
 Architecture Highlights:
 ========================
-1. Spectral Feature Extraction: 1D CNN layers capture local spectral patterns
+1. Spectral Feature Extraction: Original ARAD 1D CNN encoder captures local spectral patterns
    (peaks, edges, broadening) before LSTM processing
 2. Count Rate Side-Channel: Gross count rate (counts/s) bypasses the CNN and is
    concatenated with CNN features before the LSTM, providing intensity context
@@ -16,7 +16,7 @@ Architecture Highlights:
    relevant historical spectra when predicting the current spectrum
 4. Bidirectional Option: For offline analysis, bidirectional LSTM provides
    richer context; for streaming, causal (unidirectional) mode is used
-5. Latent-Only Decoder: Reconstruction depends entirely on the LSTM latent
+5. Latent-Only Decoder: Original ARAD 1D CNN decoder reconstructs from the LSTM latent
    representation — no skip connections — forcing the model to learn
    genuine temporal patterns rather than shortcutting via direct features
 
@@ -62,6 +62,7 @@ except ImportError:
 
 from gammaflow.core.time_series import SpectralTimeSeries
 from gammaflow.core.spectrum import Spectrum
+from src.detectors.arad import ARADEncoderBlock, ARADDecoderBlock
 
 
 # =============================================================================
@@ -527,18 +528,146 @@ class SpectralDecoder(nn.Module):
         return torch.sigmoid(logits)
 
 
+class ARADCNNSpectralFeatureExtractor(nn.Module):
+    """
+    ARAD-style 1D CNN encoder for per-spectrum feature extraction.
+
+    Uses the original ARAD encoder block stack and projects each spectrum
+    to a fixed-dimensional embedding for temporal modeling.
+    """
+
+    def __init__(
+        self,
+        n_bins: int,
+        feature_dim: int = 128,
+        dropout: float = 0.2,
+    ):
+        super().__init__()
+
+        if n_bins % 32 != 0:
+            raise ValueError(
+                f"n_bins must be divisible by 32 for ARAD CNN encoder/decoder, got {n_bins}"
+            )
+
+        self.n_bins = n_bins
+        self.feature_dim = feature_dim
+
+        self.encoder = nn.Sequential(
+            ARADEncoderBlock(1, 8, 7, dropout),
+            ARADEncoderBlock(8, 8, 5, dropout),
+            ARADEncoderBlock(8, 8, 3, dropout),
+            ARADEncoderBlock(8, 8, 3, dropout),
+            ARADEncoderBlock(8, 8, 3, dropout),
+            nn.Flatten(),
+            nn.Linear(8 * (n_bins // 32), feature_dim),
+            nn.Mish(),
+            nn.BatchNorm1d(feature_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x : torch.Tensor
+            Spectra, shape (batch, seq_len, n_bins)
+
+        Returns
+        -------
+        torch.Tensor
+            Features, shape (batch, seq_len, feature_dim)
+        """
+        batch_size, seq_len, n_bins = x.shape
+        x_flat = x.reshape(batch_size * seq_len, 1, n_bins)
+        features = self.encoder(x_flat)
+        return features.reshape(batch_size, seq_len, self.feature_dim)
+
+
+class ARADCNNSpectralDecoder(nn.Module):
+    """
+    ARAD-style CNN decoder for spectrum reconstruction from latent vectors.
+    """
+
+    def __init__(
+        self,
+        n_bins: int,
+        latent_dim: int,
+        dropout: float = 0.2,
+        output_activation: str = "sigmoid",
+    ):
+        super().__init__()
+
+        if n_bins % 32 != 0:
+            raise ValueError(
+                f"n_bins must be divisible by 32 for ARAD CNN encoder/decoder, got {n_bins}"
+            )
+
+        self.n_bins = n_bins
+        self.output_activation = output_activation.lower()
+        if self.output_activation not in ["sigmoid", "softmax"]:
+            raise ValueError(
+                f"output_activation must be 'sigmoid' or 'softmax', got '{output_activation}'"
+            )
+
+        self.decoder_linear = nn.Sequential(
+            nn.Linear(latent_dim, 8 * (n_bins // 32)),
+            nn.Mish(),
+            nn.BatchNorm1d(8 * (n_bins // 32)),
+        )
+
+        self.decoder_body = nn.Sequential(
+            ARADDecoderBlock(8, 8, 3, dropout),
+            ARADDecoderBlock(8, 8, 3, dropout),
+            ARADDecoderBlock(8, 8, 3, dropout),
+            ARADDecoderBlock(8, 8, 5, dropout),
+        )
+
+        if self.output_activation == "sigmoid":
+            self.output_block = ARADDecoderBlock(8, 1, 7, dropout, is_output=True)
+            self.output_layer = None
+        else:
+            self.output_block = None
+            # Softmax needs logits, so keep ARAD upsample+deconv shape path.
+            self.output_layer = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='nearest'),
+                nn.ConvTranspose1d(8, 1, 7, padding=3),
+            )
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        latent : torch.Tensor
+            Latent representation, shape (batch, latent_dim)
+
+        Returns
+        -------
+        torch.Tensor
+            Reconstructed spectrum, shape (batch, n_bins)
+        """
+        decoded = self.decoder_linear(latent)
+        decoded = decoded.view(decoded.size(0), 8, self.n_bins // 32)
+        decoded = self.decoder_body(decoded)
+
+        if self.output_block is not None:
+            reconstructed = self.output_block(decoded)
+            return reconstructed.squeeze(1)
+
+        logits = self.output_layer(decoded).squeeze(1)
+        return F.softmax(logits, dim=-1)
+
+
 class TemporalLSTMAutoencoder(nn.Module):
     """
     Advanced Temporal LSTM Autoencoder for gamma-ray spectra.
     
     Architecture:
-    1. Spectral Feature Extraction: 1D CNN captures local spectral patterns
+    1. Spectral Feature Extraction: ARAD 1D CNN encoder captures local spectral patterns
     2. Count Rate Side-Channel: log-scaled gross count rate (bypasses CNN,
        concatenated with CNN features before LSTM — provides intensity context)
     3. Temporal LSTM Encoding: Processes sequence of spectral+count-rate features
     4. Temporal Attention: Self-attention for focusing on relevant history
     5. Latent Projection: Compress to latent representation
-    6. Latent-Only Decoder: Reconstruct spectrum purely from LSTM latent
+    6. Latent-Only Decoder: ARAD CNN decoder reconstructs from LSTM latent
     
     Parameters
     ----------
@@ -566,6 +695,11 @@ class TemporalLSTMAutoencoder(nn.Module):
         Dimensionality of the count rate embedding. The raw log-scaled
         count rate is projected to this size so it doesn't get drowned
         out by the hidden_size-dimensional CNN features. Default 8.
+    use_arad_cnn : bool
+        If True (default), use original ARAD CNN encoder/decoder blocks
+        for per-spectrum feature extraction and reconstruction.
+        If False, use the legacy ARAD-LSTM feature extractor + MLP decoder
+        for backward compatibility with older checkpoints.
     """
     
     def __init__(
@@ -581,6 +715,7 @@ class TemporalLSTMAutoencoder(nn.Module):
         use_count_rate: bool = True,
         count_rate_dim: int = 8,
         output_activation: str = "sigmoid",
+        use_arad_cnn: bool = True,
     ):
         super().__init__()
         
@@ -593,14 +728,27 @@ class TemporalLSTMAutoencoder(nn.Module):
         self.use_count_rate = use_count_rate
         self.count_rate_dim = count_rate_dim
         self.output_activation = output_activation.lower()
+        self.use_arad_cnn = use_arad_cnn
+
+        if self.use_arad_cnn and n_bins % 32 != 0:
+            raise ValueError(
+                f"n_bins must be divisible by 32 for ARAD CNN hybrid, got {n_bins}"
+            )
         
         # 1. Spectral Feature Extraction
-        self.feature_extractor = SpectralFeatureExtractor(
-            n_bins=n_bins,
-            feature_dim=hidden_size,
-            n_layers=3,
-            dropout=dropout
-        )
+        if self.use_arad_cnn:
+            self.feature_extractor = ARADCNNSpectralFeatureExtractor(
+                n_bins=n_bins,
+                feature_dim=hidden_size,
+                dropout=dropout,
+            )
+        else:
+            self.feature_extractor = SpectralFeatureExtractor(
+                n_bins=n_bins,
+                feature_dim=hidden_size,
+                n_layers=3,
+                dropout=dropout
+            )
         
         # Count rate side-channel: log-scale + learned projection to embedding
         # Bypasses CNN, concatenated with spectral features before LSTM.
@@ -650,13 +798,21 @@ class TemporalLSTMAutoencoder(nn.Module):
         )
         
         # 5. Decoder (latent-only, no skip connections)
-        self.decoder = SpectralDecoder(
-            n_bins=n_bins,
-            latent_dim=latent_dim,
-            hidden_size=hidden_size,
-            dropout=dropout,
-            output_activation=self.output_activation,
-        )
+        if self.use_arad_cnn:
+            self.decoder = ARADCNNSpectralDecoder(
+                n_bins=n_bins,
+                latent_dim=latent_dim,
+                dropout=dropout,
+                output_activation=self.output_activation,
+            )
+        else:
+            self.decoder = SpectralDecoder(
+                n_bins=n_bins,
+                latent_dim=latent_dim,
+                hidden_size=hidden_size,
+                dropout=dropout,
+                output_activation=self.output_activation,
+            )
         
         # Initialize weights
         self.apply(self._init_weights)
@@ -664,14 +820,15 @@ class TemporalLSTMAutoencoder(nn.Module):
     @staticmethod
     def _init_weights(module):
         """Initialize weights with proper initialization."""
-        if isinstance(module, nn.Linear):
+        if isinstance(module, (nn.Conv1d, nn.ConvTranspose1d)):
+            # Match ARAD initialization for convolutional layers.
+            nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='linear')
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0.01)
+        elif isinstance(module, nn.Linear):
             nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0.01)
-        elif isinstance(module, nn.Conv1d):
-            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
-            if module.bias is not None:
-                nn.init.constant_(module.bias, 0)
         elif isinstance(module, nn.LSTM):
             for name, param in module.named_parameters():
                 if 'weight_ih' in name:
@@ -883,6 +1040,10 @@ class ARADLSTMDetector:
     output_activation : str, default='sigmoid'
         Output activation for decoder: 'sigmoid' or 'softmax'.
         Use 'softmax' for strictly distribution-valued outputs.
+    use_arad_cnn : bool, default=True
+        If True, use original ARAD CNN encoder/decoder blocks as the
+        spatial front/back ends around the temporal LSTM core.
+        If False, use legacy ARAD-LSTM CNN/MLP modules for compatibility.
     verbose : bool, default=True
         Print training progress
     
@@ -923,6 +1084,7 @@ class ARADLSTMDetector:
         use_count_rate: bool = True,
         count_rate_dim: int = 8,
         output_activation: str = 'sigmoid',
+        use_arad_cnn: bool = True,
         verbose: bool = True
     ):
         if not TORCH_AVAILABLE:
@@ -953,6 +1115,7 @@ class ARADLSTMDetector:
         self.use_count_rate = use_count_rate
         self.count_rate_dim = count_rate_dim
         self.output_activation = output_activation.lower()
+        self.use_arad_cnn = use_arad_cnn
         self.verbose = verbose
         
         if self.loss_type not in ['jsd', 'mse', 'chi2']:
@@ -1198,6 +1361,7 @@ class ARADLSTMDetector:
             use_count_rate=self.use_count_rate,
             count_rate_dim=self.count_rate_dim,
             output_activation=self.output_activation,
+            use_arad_cnn=self.use_arad_cnn,
         ).to(self.device)
 
         return self._fit_with_dataloaders(train_loader, val_loader)
@@ -1264,6 +1428,7 @@ class ARADLSTMDetector:
             total_params = sum(p.numel() for p in self.model_.parameters())
             trainable = sum(p.numel() for p in self.model_.parameters() if p.requires_grad)
             print(f"Architecture: {'Bidirectional' if self.bidirectional else 'Causal'} LSTM")
+            print(f"  Spatial backbone: {'ARAD CNN encoder/decoder' if self.use_arad_cnn else 'Legacy CNN/MLP'}")
             print(f"  Attention: {'Enabled' if self.use_attention else 'Disabled'}")
             print(f"  Total parameters: {total_params:,}")
             print(f"  Trainable parameters: {trainable:,}")
@@ -2279,6 +2444,7 @@ class ARADLSTMDetector:
             'use_count_rate': self.use_count_rate,
             'count_rate_dim': self.count_rate_dim,
             'output_activation': self.output_activation,
+            'use_arad_cnn': self.use_arad_cnn,
             'threshold': self.threshold,
             'loss_type': self.loss_type,
             'target_mode': self.target_mode,
@@ -2314,6 +2480,18 @@ class ARADLSTMDetector:
         self.use_count_rate = checkpoint.get('use_count_rate', _has_cr_weights)
         self.count_rate_dim = checkpoint.get('count_rate_dim', 8)
         self.output_activation = checkpoint.get('output_activation', 'sigmoid').lower()
+        # Default ARAD-CNN path to True, but detect legacy checkpoints that
+        # were saved before this flag existed and still use the old CNN/MLP stack.
+        _legacy_feature_keys = (
+            'feature_extractor.conv_layers',
+            'feature_extractor.global_proj',
+            'decoder.decoder_mlp',
+        )
+        _has_legacy_modules = any(
+            any(k.startswith(prefix) for prefix in _legacy_feature_keys)
+            for k in checkpoint['model_state']
+        )
+        self.use_arad_cnn = checkpoint.get('use_arad_cnn', not _has_legacy_modules)
         self.threshold = checkpoint['threshold']
         self.loss_type = checkpoint['loss_type']
         self.target_mode = checkpoint.get('target_mode', 'next')
@@ -2331,6 +2509,7 @@ class ARADLSTMDetector:
             use_count_rate=self.use_count_rate,
             count_rate_dim=self.count_rate_dim,
             output_activation=self.output_activation,
+            use_arad_cnn=self.use_arad_cnn,
         ).to(self.device)
         
         self.model_.load_state_dict(checkpoint['model_state'])

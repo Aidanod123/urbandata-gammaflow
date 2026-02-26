@@ -336,13 +336,14 @@ def main():
     print(f"  Epochs: {args.epochs}")
     print(f"  Loss function: {args.loss.upper()}")
     print(f"  Output activation: {args.output_activation}")
+    print("  Spatial backbone: ARAD CNN encoder/decoder")
     print(f"  Data augmentation: {not args.no_augmentation}")
     print(f"  Count rate side-channel: {not args.no_count_rate}")
     print(f"  Cache size: {args.cache_size} runs")
     print()
     
     for seq_len in sequence_lengths:
-        print("Initializing ARAD-LSTM detector...")
+        print("Initializing ARAD-CNN + LSTM detector...")
         detector = ARADLSTMDetector(
             sequence_length=seq_len,
             hidden_size=HIDDEN_SIZE,
