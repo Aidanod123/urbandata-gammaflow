@@ -466,6 +466,8 @@ def main():
         "energy_range": list(energy_range),
         "time_units": args.time_units,
         "normalization": "per-spectrum-l1",
+        "count_rate_definition": "gross_cps=sum(counts_per_bin/live_time)",
+        "count_rate_features_recommended": ["gross_cps", "log1p(gross_cps)", "delta_log_cps"],
         "wall_time_seconds": round(wall_elapsed, 2),
     }
     stats_path = output_dir / "preprocess_stats.json"

@@ -20,17 +20,10 @@ def inspect_dir(data_dir: Path, n_runs: int = 2, n_spectra: int = 3):
     for pt_file in pt_files[:n_runs]:
         data = torch.load(pt_file, map_location="cpu", weights_only=False)
         spectra = data["spectra"]
-        has_cr = "count_rates" in data
 
         print(f"\n  {pt_file.name}:")
         print(f"    spectra shape:   {tuple(spectra.shape)}")
         print(f"    spectra dtype:   {spectra.dtype}")
-        if has_cr:
-            cr = data["count_rates"]
-            print(f"    count_rates shape: {tuple(cr.shape)}")
-            print(f"    count_rates dtype: {cr.dtype}")
-        else:
-            print(f"    count_rates:     MISSING (legacy file)")
 
         print(f"    normalization:   {data.get('normalization', 'n/a')}")
         print(f"    integration:     {data.get('integration_time', 'n/a')}s")
@@ -40,10 +33,7 @@ def inspect_dir(data_dir: Path, n_runs: int = 2, n_spectra: int = 3):
             s = spectra[i].numpy()
             l1_sum = s.sum()
             print(f"    spectrum[{i}]: min={s.min():.6f}  max={s.max():.6f}  "
-                  f"sum={l1_sum:.6f}  nonzero={np.count_nonzero(s)}/{len(s)}", end="")
-            if has_cr:
-                print(f"  count_rate={cr[i].item():.2f} cps", end="")
-            print()
+                  f"sum={l1_sum:.6f}  nonzero={np.count_nonzero(s)}/{len(s)}")
 
 
 def main():

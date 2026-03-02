@@ -9,14 +9,11 @@ Architecture Highlights:
 ========================
 1. Spectral Feature Extraction: Original ARAD 1D CNN encoder captures local spectral patterns
    (peaks, edges, broadening) before LSTM processing
-2. Count Rate Side-Channel: Gross count rate (counts/s) bypasses the CNN and is
-   concatenated with CNN features before the LSTM, providing intensity context
-   without corrupting the L1-normalized spectral shape
-3. Temporal Attention: Self-attention mechanism allows the model to focus on
+2. Temporal Attention: Self-attention mechanism allows the model to focus on
    relevant historical spectra when predicting the current spectrum
-4. Bidirectional Option: For offline analysis, bidirectional LSTM provides
+3. Bidirectional Option: For offline analysis, bidirectional LSTM provides
    richer context; for streaming, causal (unidirectional) mode is used
-5. Latent-Only Decoder: Original ARAD 1D CNN decoder reconstructs from the LSTM latent
+4. Latent-Only Decoder: Original ARAD 1D CNN decoder reconstructs from the LSTM latent
    representation — no skip connections — forcing the model to learn
    genuine temporal patterns rather than shortcutting via direct features
 
@@ -148,12 +145,9 @@ class PreprocessedRunDataset(Dataset):
 
     Each run is stored as a .pt file containing:
         - spectra: torch.FloatTensor (n_spectra, n_bins) — L1-normalized (each row sums to 1)
-        - count_rates: torch.FloatTensor (n_spectra,) — gross count rate (counts/s) per spectrum
         - timestamps, live_times, real_times, energy_edges (optional)
 
-    Returns 3-tuple: (sequence, target, count_rates) where count_rates
-    covers the sequence window (and includes the target position for
-    'next' mode so the model can use it during training).
+    Returns 2-tuple: (sequence, target).
 
     This dataset builds a lightweight index over runs and sequences, and
     optionally caches a configurable number of runs in memory.
@@ -217,16 +211,13 @@ class PreprocessedRunDataset(Dataset):
 
         self.n_samples = len(self.index)
 
-    def _load_run_spectra(self, run_file: Path) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Load L1-normalized spectra and count rates from a run file.
+    def _load_run_spectra(self, run_file: Path) -> torch.Tensor:
+        """Load L1-normalized spectra from a run file.
         
         Returns
         -------
         spectra : torch.Tensor
             L1-normalized spectra, shape (n_spectra, n_bins)
-        count_rates : torch.Tensor
-            Gross count rates (counts/s), shape (n_spectra,).
-            Falls back to zeros if count_rates not in file (legacy data).
         """
         if run_file in self._cache:
             self._cache.move_to_end(run_file)
@@ -235,17 +226,11 @@ class PreprocessedRunDataset(Dataset):
         data = torch.load(run_file, map_location='cpu', weights_only=False)
         spectra = data["spectra"].float()
 
-        # Support legacy .pt files that lack count_rates
-        if "count_rates" in data:
-            count_rates = data["count_rates"].float()
-        else:
-            count_rates = torch.zeros(spectra.shape[0])
-
-        self._cache[run_file] = (spectra, count_rates)
+        self._cache[run_file] = spectra
         while len(self._cache) > self.cache_size_runs:
             self._cache.popitem(last=False)
 
-        return spectra, count_rates
+        return spectra
 
     def __len__(self):
         return self.n_samples
@@ -253,16 +238,14 @@ class PreprocessedRunDataset(Dataset):
     def __getitem__(self, idx):
         run_file, seq_start = self.index[idx]
 
-        spectra, count_rates = self._load_run_spectra(run_file)
+        spectra = self._load_run_spectra(run_file)
 
         if self.target_mode == 'next':
             sequence = spectra[seq_start:seq_start + self.sequence_length].clone()
             target = spectra[seq_start + self.sequence_length].clone()
-            seq_cr = count_rates[seq_start:seq_start + self.sequence_length].clone()
         else:
             sequence = spectra[seq_start:seq_start + self.sequence_length].clone()
             target = sequence[-1].clone()
-            seq_cr = count_rates[seq_start:seq_start + self.sequence_length].clone()
 
         if self.augmentation is not None:
             sequence_np = sequence.numpy()
@@ -270,7 +253,7 @@ class PreprocessedRunDataset(Dataset):
                 sequence_np[i] = self.augmentation(sequence_np[i])
             sequence = torch.FloatTensor(sequence_np)
 
-        return torch.FloatTensor(sequence), torch.FloatTensor(target), seq_cr.float()
+        return torch.FloatTensor(sequence), torch.FloatTensor(target)
 
 
 # =============================================================================
@@ -281,8 +264,10 @@ class SpectralFeatureExtractor(nn.Module):
     """
     1D CNN for extracting local spectral features.
     
-    Captures local patterns like peaks, edges, and broadening that are
-    characteristic of specific isotopes or background components.
+    .. deprecated::
+        Legacy feature extractor kept for backward compatibility with older
+        checkpoints. Use ``ARADCNNSpectralFeatureExtractor`` (via
+        ``use_arad_cnn=True``) for new models.
     
     Parameters
     ----------
@@ -304,6 +289,13 @@ class SpectralFeatureExtractor(nn.Module):
         dropout: float = 0.2
     ):
         super().__init__()
+        warnings.warn(
+            "SpectralFeatureExtractor is deprecated and kept only for loading "
+            "legacy checkpoints. Use ARADCNNSpectralFeatureExtractor "
+            "(use_arad_cnn=True) for new models.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         
         self.n_bins = n_bins
         self.feature_dim = feature_dim
@@ -461,10 +453,10 @@ class SpectralDecoder(nn.Module):
     """
     Decoder for spectrum reconstruction from latent representation.
     
-    Reconstructs the target spectrum entirely from the LSTM latent
-    representation, with no skip connections. This forces the temporal
-    encoder to learn a complete representation of spectral dynamics
-    rather than relying on direct feature shortcuts.
+    .. deprecated::
+        Legacy MLP decoder kept for backward compatibility with older
+        checkpoints. Use ``ARADCNNSpectralDecoder`` (via
+        ``use_arad_cnn=True``) for new models.
     
     Parameters
     ----------
@@ -487,6 +479,13 @@ class SpectralDecoder(nn.Module):
         output_activation: str = "sigmoid",
     ):
         super().__init__()
+        warnings.warn(
+            "SpectralDecoder is deprecated and kept only for loading legacy "
+            "checkpoints. Use ARADCNNSpectralDecoder (use_arad_cnn=True) "
+            "for new models.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         
         self.n_bins = n_bins
         self.output_activation = output_activation.lower()
@@ -592,7 +591,7 @@ class ARADCNNSpectralDecoder(nn.Module):
         n_bins: int,
         latent_dim: int,
         dropout: float = 0.2,
-        output_activation: str = "sigmoid",
+        output_activation: str = "softmax",
     ):
         super().__init__()
 
@@ -662,12 +661,10 @@ class TemporalLSTMAutoencoder(nn.Module):
     
     Architecture:
     1. Spectral Feature Extraction: ARAD 1D CNN encoder captures local spectral patterns
-    2. Count Rate Side-Channel: log-scaled gross count rate (bypasses CNN,
-       concatenated with CNN features before LSTM — provides intensity context)
-    3. Temporal LSTM Encoding: Processes sequence of spectral+count-rate features
-    4. Temporal Attention: Self-attention for focusing on relevant history
-    5. Latent Projection: Compress to latent representation
-    6. Latent-Only Decoder: ARAD CNN decoder reconstructs from LSTM latent
+    2. Temporal LSTM Encoding: Processes the sequence of spectral features
+    3. Temporal Attention: Self-attention for focusing on relevant history
+    4. Latent Projection: Compress to latent representation
+    5. Latent-Only Decoder: ARAD CNN decoder reconstructs from LSTM latent
     
     Parameters
     ----------
@@ -688,13 +685,6 @@ class TemporalLSTMAutoencoder(nn.Module):
         Whether to use temporal attention mechanism
     num_attention_heads : int
         Number of attention heads (if using attention)
-    use_count_rate : bool
-        If True, inject gross count rate as a side-channel before LSTM.
-        LSTM input_size becomes hidden_size + count_rate_dim.
-    count_rate_dim : int
-        Dimensionality of the count rate embedding. The raw log-scaled
-        count rate is projected to this size so it doesn't get drowned
-        out by the hidden_size-dimensional CNN features. Default 8.
     use_arad_cnn : bool
         If True (default), use original ARAD CNN encoder/decoder blocks
         for per-spectrum feature extraction and reconstruction.
@@ -712,9 +702,7 @@ class TemporalLSTMAutoencoder(nn.Module):
         bidirectional: bool = False,
         use_attention: bool = True,
         num_attention_heads: int = 4,
-        use_count_rate: bool = True,
-        count_rate_dim: int = 8,
-        output_activation: str = "sigmoid",
+        output_activation: str = "softmax",
         use_arad_cnn: bool = True,
     ):
         super().__init__()
@@ -725,8 +713,6 @@ class TemporalLSTMAutoencoder(nn.Module):
         self.num_layers = num_layers
         self.bidirectional = bidirectional
         self.use_attention = use_attention
-        self.use_count_rate = use_count_rate
-        self.count_rate_dim = count_rate_dim
         self.output_activation = output_activation.lower()
         self.use_arad_cnn = use_arad_cnn
 
@@ -750,24 +736,9 @@ class TemporalLSTMAutoencoder(nn.Module):
                 dropout=dropout
             )
         
-        # Count rate side-channel: log-scale + learned projection to embedding
-        # Bypasses CNN, concatenated with spectral features before LSTM.
-        # Projected to count_rate_dim so it doesn't get drowned out by
-        # the hidden_size-dimensional CNN features.
-        if use_count_rate:
-            self.count_rate_proj = nn.Sequential(
-                nn.Linear(1, count_rate_dim),
-                nn.LayerNorm(count_rate_dim),
-                nn.Mish(),
-            )
-            lstm_input_size = hidden_size + count_rate_dim
-        else:
-            self.count_rate_proj = None
-            lstm_input_size = hidden_size
-        
         # 2. Temporal LSTM Encoder
         self.encoder_lstm = nn.LSTM(
-            input_size=lstm_input_size,
+            input_size=hidden_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
@@ -860,7 +831,7 @@ class TemporalLSTMAutoencoder(nn.Module):
         """
         return torch.clamp(x, 0.0, 1.0)
     
-    def encode(self, sequence: torch.Tensor, count_rates: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def encode(self, sequence: torch.Tensor) -> torch.Tensor:
         """
         Encode a sequence of spectra to latent representation.
         
@@ -872,36 +843,20 @@ class TemporalLSTMAutoencoder(nn.Module):
         ----------
         sequence : torch.Tensor
             Input sequence, shape (batch, seq_len, n_bins)
-        count_rates : torch.Tensor, optional
-            Gross count rates per spectrum, shape (batch, seq_len).
-            Required if use_count_rate=True. Log-scaled internally and
-            concatenated with CNN features before LSTM.
-        
         Returns
         -------
         latent : torch.Tensor
             Latent representation, shape (batch, latent_dim)
         """
         batch_size, seq_len, n_bins = sequence.shape
-        
+
         # Normalize (L1-normalized data: clamp to [0, 1])
         normalized = self._normalize_batch(sequence)
-        
-        # 1. Extract spectral features (CNN only sees spectra, not count rates)
+
+        # 1. Extract spectral features
         features = self.feature_extractor(normalized)
         # features: (batch, seq_len, hidden_size)
-        
-        # 1b. Concatenate count rate side-channel (bypasses CNN)
-        if self.use_count_rate and count_rates is not None:
-            # Log-scale to compress dynamic range, then project to embedding
-            log_cr = torch.log1p(count_rates).unsqueeze(-1)  # (batch, seq_len, 1)
-            cr_feat = self.count_rate_proj(log_cr)  # (batch, seq_len, count_rate_dim)
-            features = torch.cat([features, cr_feat], dim=-1)  # (batch, seq_len, hidden_size+count_rate_dim)
-        elif self.use_count_rate:
-            # No count rates provided — pad with zeros (backward compat)
-            zeros = torch.zeros(batch_size, seq_len, self.count_rate_dim, device=features.device, dtype=features.dtype)
-            features = torch.cat([features, zeros], dim=-1)
-        
+
         # 2. LSTM temporal encoding
         lstm_out, (h_n, c_n) = self.encoder_lstm(features)
         # lstm_out: (batch, seq_len, hidden_size * num_directions)
@@ -934,7 +889,7 @@ class TemporalLSTMAutoencoder(nn.Module):
         """
         return self.decoder(latent)
     
-    def forward(self, sequence: torch.Tensor, count_rates: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, sequence: torch.Tensor) -> torch.Tensor:
         """
         Forward pass: encode sequence and reconstruct target spectrum.
         
@@ -942,16 +897,12 @@ class TemporalLSTMAutoencoder(nn.Module):
         ----------
         sequence : torch.Tensor
             Input sequence of spectra, shape (batch, seq_len, n_bins)
-        count_rates : torch.Tensor, optional
-            Gross count rates, shape (batch, seq_len).
-            Passed through to encoder as side-channel.
-        
         Returns
         -------
         torch.Tensor
             Reconstructed spectrum, shape (batch, n_bins)
         """
-        latent = self.encode(sequence, count_rates=count_rates)
+        latent = self.encode(sequence)
         reconstructed = self.decode(latent)
         return reconstructed
 
@@ -1021,25 +972,19 @@ class ARADLSTMDetector:
         Loss function: 'chi2', 'jsd', or 'mse'
     gradient_clip : float, default=1.0
         Gradient clipping value for stability
-    use_augmentation : bool, default=True
+    use_augmentation : bool, default=False
         Whether to use data augmentation during training
     target_mode : str, default='next'
         Target mode: 'next' (predict next spectrum after sequence) or
         'last' (reconstruct last spectrum in sequence).
         'next' is recommended for anomaly detection as it compares
         predicted vs actual next spectrum.
-    use_count_rate : bool, default=True
-        Whether to inject gross count rate as a side-channel.
-        When True, the per-spectrum total count rate (counts/second)
-        bypasses the CNN and is projected to an embedding, then
-        concatenated with CNN features before the LSTM.
-    count_rate_dim : int, default=8
-        Dimensionality of the count rate embedding. Projected from
-        the raw log-scaled scalar so it doesn't get drowned out by
-        the hidden_size-dimensional CNN features.
-    output_activation : str, default='sigmoid'
-        Output activation for decoder: 'sigmoid' or 'softmax'.
-        Use 'softmax' for strictly distribution-valued outputs.
+    output_activation : str, default='softmax'
+        Output activation for decoder: 'softmax' or 'sigmoid'.
+        'softmax' is recommended for L1-normalized data because it produces
+        a valid probability distribution (sums to 1) by construction.
+        'sigmoid' may be needed for backward compatibility with older
+        checkpoints trained on max-normalized data.
     use_arad_cnn : bool, default=True
         If True, use original ARAD CNN encoder/decoder blocks as the
         spatial front/back ends around the temporal LSTM core.
@@ -1079,11 +1024,9 @@ class ARADLSTMDetector:
         min_training_samples: int = 200,
         loss_type: str = 'chi2',
         gradient_clip: float = 1.0,
-        use_augmentation: bool = True,
+        use_augmentation: bool = False,
         target_mode: str = 'next',
-        use_count_rate: bool = True,
-        count_rate_dim: int = 8,
-        output_activation: str = 'sigmoid',
+        output_activation: str = 'softmax',
         use_arad_cnn: bool = True,
         verbose: bool = True
     ):
@@ -1112,8 +1055,6 @@ class ARADLSTMDetector:
         self.gradient_clip = gradient_clip
         self.use_augmentation = use_augmentation
         self.target_mode = target_mode
-        self.use_count_rate = use_count_rate
-        self.count_rate_dim = count_rate_dim
         self.output_activation = output_activation.lower()
         self.use_arad_cnn = use_arad_cnn
         self.verbose = verbose
@@ -1154,7 +1095,6 @@ class ARADLSTMDetector:
         
         # Buffer for streaming detection
         self._spectrum_buffer: List[np.ndarray] = []
-        self._count_rate_buffer: List[float] = []
         
         # Augmentation config
         self.augmentation = SpectralAugmentation(
@@ -1290,9 +1230,17 @@ class ARADLSTMDetector:
         rng = np.random.RandomState(42)
         indices = rng.permutation(len(run_files))
         run_files = [run_files[i] for i in indices]
-        n_val = max(1, int(len(run_files) * validation_split_runs))
-        val_run_files = run_files[:n_val]
-        train_run_files = run_files[n_val:]
+        n_runs = len(run_files)
+        if n_runs == 1 or validation_split_runs <= 0:
+            # Keep training possible for tiny experiments.
+            train_run_files = run_files
+            val_run_files = run_files
+        else:
+            # Ensure both splits are non-empty.
+            n_val = int(n_runs * validation_split_runs)
+            n_val = min(max(1, n_val), n_runs - 1)
+            val_run_files = run_files[:n_val]
+            train_run_files = run_files[n_val:]
 
         if self.verbose:
             print(f"Preprocessed runs: {len(run_files)}")
@@ -1358,8 +1306,6 @@ class ARADLSTMDetector:
             bidirectional=self.bidirectional,
             use_attention=self.use_attention,
             num_attention_heads=self.num_attention_heads,
-            use_count_rate=self.use_count_rate,
-            count_rate_dim=self.count_rate_dim,
             output_activation=self.output_activation,
             use_arad_cnn=self.use_arad_cnn,
         ).to(self.device)
@@ -1445,18 +1391,17 @@ class ARADLSTMDetector:
             train_losses = []
             
             for batch in train_loader:
-                batch_x, batch_target, batch_cr = batch[0], batch[1], batch[2]
+                batch_x, batch_target = batch[0], batch[1]
                 # Non-blocking transfer to GPU
                 batch_x = batch_x.to(self.device, non_blocking=True)
                 batch_target = batch_target.to(self.device, non_blocking=True)
-                batch_cr = batch_cr.to(self.device, non_blocking=True)
                 
                 optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
                 
                 if use_amp:
                     # Mixed precision forward pass
                     with torch.amp.autocast('cuda'):
-                        reconstructed = compiled_model(batch_x, count_rates=batch_cr)
+                        reconstructed = compiled_model(batch_x)
                         
                         target_norm = self._normalize_spectrum(batch_target)
                         reconstructed_norm = self._normalize_spectrum(reconstructed)
@@ -1483,7 +1428,7 @@ class ARADLSTMDetector:
                     scaler.update()
                 else:
                     # Standard precision forward pass
-                    reconstructed = compiled_model(batch_x, count_rates=batch_cr)
+                    reconstructed = compiled_model(batch_x)
                     
                     target_norm = self._normalize_spectrum(batch_target)
                     reconstructed_norm = self._normalize_spectrum(reconstructed)
@@ -1516,14 +1461,13 @@ class ARADLSTMDetector:
             
             with torch.no_grad():
                 for batch in val_loader:
-                    batch_x, batch_target, batch_cr = batch[0], batch[1], batch[2]
+                    batch_x, batch_target = batch[0], batch[1]
                     batch_x = batch_x.to(self.device, non_blocking=True)
                     batch_target = batch_target.to(self.device, non_blocking=True)
-                    batch_cr = batch_cr.to(self.device, non_blocking=True)
                     
                     if use_amp:
                         with torch.amp.autocast('cuda'):
-                            reconstructed = compiled_model(batch_x, count_rates=batch_cr)
+                            reconstructed = compiled_model(batch_x)
                             target_norm = self._normalize_spectrum(batch_target)
                             reconstructed_norm = self._normalize_spectrum(reconstructed)
                             
@@ -1534,7 +1478,7 @@ class ARADLSTMDetector:
                             else:
                                 loss = self._mse_loss(target_norm, reconstructed_norm)
                     else:
-                        reconstructed = compiled_model(batch_x, count_rates=batch_cr)
+                        reconstructed = compiled_model(batch_x)
                         target_norm = self._normalize_spectrum(batch_target)
                         reconstructed_norm = self._normalize_spectrum(reconstructed)
                         
@@ -1614,7 +1558,7 @@ class ARADLSTMDetector:
         kld_pm = torch.sum(p * torch.log(p / m), dim=-1)
         kld_qm = torch.sum(q * torch.log(q / m), dim=-1)
         
-        return torch.sqrt(0.5 * (kld_pm + kld_qm)).mean()
+        return torch.sqrt(torch.clamp(0.5 * (kld_pm + kld_qm), min=0.0)).mean()
     
     def _mse_loss(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
         """Mean Squared Error loss."""
@@ -1679,7 +1623,6 @@ class ARADLSTMDetector:
         self, 
         sequence: np.ndarray, 
         target: Optional[np.ndarray] = None,
-        count_rates: Optional[np.ndarray] = None,
     ) -> float:
         """
         Score a sequence by comparing model prediction to target spectrum.
@@ -1695,10 +1638,6 @@ class ARADLSTMDetector:
             The actual target spectrum to compare against.
             Required for target_mode='next' (the actual next spectrum).
             For target_mode='last', this is ignored and sequence[-1] is used.
-        count_rates : np.ndarray, optional
-            Gross count rates per spectrum, shape (sequence_length,).
-            Used as side-channel input to the model.
-        
         Returns
         -------
         float
@@ -1731,14 +1670,11 @@ class ARADLSTMDetector:
         # Convert to tensors
         x = torch.FloatTensor(sequence).unsqueeze(0).to(self.device)
         target_tensor = torch.FloatTensor(target_spectrum).unsqueeze(0).to(self.device)
-        cr_tensor = None
-        if count_rates is not None:
-            cr_tensor = torch.FloatTensor(count_rates).unsqueeze(0).to(self.device)
-        
+
         # Get prediction/reconstruction
         self.model_.eval()
         with torch.no_grad():
-            predicted = self.model_(x, count_rates=cr_tensor)
+            predicted = self.model_(x)
         
         # Compute score
         target_norm = self._normalize_spectrum(target_tensor)
@@ -1757,7 +1693,6 @@ class ARADLSTMDetector:
         self,
         sequences: np.ndarray,
         targets: Optional[np.ndarray] = None,
-        count_rates: Optional[np.ndarray] = None,
         batch_size: int = 256,
     ) -> np.ndarray:
         """
@@ -1774,9 +1709,6 @@ class ARADLSTMDetector:
             Array of target spectra, shape (n_sequences, n_bins).
             Required for target_mode='next' (the actual next spectra).
             For target_mode='last', ignored and sequences[:, -1, :] is used.
-        count_rates : np.ndarray, optional
-            Gross count rates, shape (n_sequences, sequence_length).
-            Used as side-channel input to the model.
         batch_size : int
             Number of sequences to process in each batch. Larger batches are
             more efficient but use more GPU memory. Default 256.
@@ -1827,13 +1759,8 @@ class ARADLSTMDetector:
                 x = torch.FloatTensor(batch).to(self.device)
                 targets_tensor = torch.FloatTensor(batch_targets).to(self.device)
                 
-                # Count rate side-channel
-                cr_tensor = None
-                if count_rates is not None:
-                    cr_tensor = torch.FloatTensor(count_rates[start_idx:end_idx]).to(self.device)
-                
                 # Forward pass for entire batch
-                predicted = self.model_(x, count_rates=cr_tensor)
+                predicted = self.model_(x)
                 
                 # Normalize
                 targets_norm = self._normalize_spectrum(targets_tensor)
@@ -1879,7 +1806,7 @@ class ARADLSTMDetector:
         kld_pm = torch.sum(p * torch.log(p / m), dim=-1)
         kld_qm = torch.sum(q * torch.log(q / m), dim=-1)
         
-        return torch.sqrt(0.5 * (kld_pm + kld_qm))
+        return torch.sqrt(torch.clamp(0.5 * (kld_pm + kld_qm), min=0.0))
 
     def _mse_loss_batch(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
         """
@@ -1960,7 +1887,7 @@ class ARADLSTMDetector:
         if not self.is_fitted_:
             raise RuntimeError("Detector must be fitted before scoring")
         
-        # Extract count rate per bin
+        # Convert to rate per bin
         counts = spectrum.counts
         time = spectrum.live_time if (spectrum.live_time is not None and not np.isnan(spectrum.live_time)) else spectrum.real_time
         spectrum_data = counts / time
@@ -1970,16 +1897,12 @@ class ARADLSTMDetector:
                 f"Spectrum has {len(spectrum_data)} bins, expected {self.n_bins_}"
             )
         
-        # Gross count rate (total counts/second) — before L1 normalization
-        gross_cr = float(spectrum_data.sum())
-        
         # L1-normalize the spectrum (consistent with detect() and training)
-        spec_sum = max(gross_cr, 1e-10)
+        spec_sum = max(float(spectrum_data.sum()), 1e-10)
         spectrum_normalized = spectrum_data / spec_sum
         
         # Add to buffers
         self._spectrum_buffer.append(spectrum_normalized)
-        self._count_rate_buffer.append(gross_cr)
         
         # Buffer size depends on target_mode:
         #   'next': need sequence_length + 1 (L context spectra + 1 target)
@@ -1989,7 +1912,6 @@ class ARADLSTMDetector:
         # Trim buffer to required size
         if len(self._spectrum_buffer) > buf_size:
             self._spectrum_buffer = self._spectrum_buffer[-buf_size:]
-            self._count_rate_buffer = self._count_rate_buffer[-buf_size:]
         
         # If buffer not full yet, return 0 (can't score)
         if len(self._spectrum_buffer) < buf_size:
@@ -2000,17 +1922,14 @@ class ARADLSTMDetector:
             # First L spectra are context, last spectrum is the target
             sequence = np.array(self._spectrum_buffer[:-1])
             target = np.array(self._spectrum_buffer[-1])
-            cr_array = np.array(self._count_rate_buffer[:-1], dtype=np.float32)
-            return self.score_sequence(sequence, target=target, count_rates=cr_array)
+            return self.score_sequence(sequence, target=target)
         else:
             sequence = np.array(self._spectrum_buffer)
-            cr_array = np.array(self._count_rate_buffer, dtype=np.float32)
-            return self.score_sequence(sequence, count_rates=cr_array)
+            return self.score_sequence(sequence)
     
     def reset_buffer(self):
         """Reset the internal spectrum buffer for streaming detection."""
         self._spectrum_buffer = []
-        self._count_rate_buffer = []
     
     def detect(
         self,
@@ -2049,18 +1968,20 @@ class ARADLSTMDetector:
                 "Use set_threshold_by_far() or set threshold manually."
             )
         
-        # Extract count rates and apply L1 normalization
+        # Convert to rates and apply L1 normalization
         counts = time_series.counts
         times = time_series.live_times
         if times is None or times.dtype == object or (hasattr(times, 'dtype') and times.dtype in [np.float32, np.float64] and np.any(np.isnan(times))):
             times = time_series.real_times
+        times = np.asarray(times, dtype=np.float64)
+        if np.any(~np.isfinite(times)) or np.any(times <= 0):
+            raise ValueError(
+                "Invalid live/real times found. All acquisition times must be finite and > 0."
+            )
         spectra = counts / times[:, np.newaxis]
         
-        # Gross count rate per spectrum (total counts/second) — before L1 norm
-        gross_count_rates = spectra.sum(axis=1)  # shape (n_spectra,)
-        
         # Apply L1 normalization to each spectrum
-        row_sums = gross_count_rates.copy()[:, np.newaxis]
+        row_sums = spectra.sum(axis=1, keepdims=True)
         row_sums = np.maximum(row_sums, 1e-10)
         spectra = spectra / row_sums
         
@@ -2078,16 +1999,10 @@ class ARADLSTMDetector:
                 # Targets: the actual next spectrum after each sequence
                 targets = spectra[self.sequence_length:]
                 
-                # Sliding windows for count rates
-                cr_windows = self._create_sliding_windows_1d(
-                    gross_count_rates[:-1], self.sequence_length
-                )
-                
                 # Score all sequences in batches
                 window_scores = self.score_sequences_batch(
                     sequences,
                     targets=targets,
-                    count_rates=cr_windows,
                     batch_size=batch_size,
                 )
                 
@@ -2101,16 +2016,10 @@ class ARADLSTMDetector:
             if n_windows > 0:
                 sequences = self._create_sliding_windows(spectra, self.sequence_length)
                 
-                # Sliding windows for count rates
-                cr_windows = self._create_sliding_windows_1d(
-                    gross_count_rates, self.sequence_length
-                )
-                
                 # Score all sequences in batches (targets=None uses last in sequence)
                 window_scores = self.score_sequences_batch(
                     sequences,
                     targets=None,
-                    count_rates=cr_windows,
                     batch_size=batch_size,
                 )
                 
@@ -2172,41 +2081,6 @@ class ARADLSTMDetector:
             windows[i] = spectra[i:i + window_size]
         return windows
 
-    def _create_sliding_windows_1d(
-        self,
-        values: np.ndarray,
-        window_size: int
-    ) -> np.ndarray:
-        """
-        Create sliding window views of a 1D array (e.g., count rates).
-        
-        Parameters
-        ----------
-        values : np.ndarray
-            1D array, shape (n_values,)
-        window_size : int
-            Size of each window
-        
-        Returns
-        -------
-        np.ndarray
-            Sliding windows, shape (n_windows, window_size)
-        """
-        n_values = len(values)
-        n_windows = n_values - window_size + 1
-        
-        try:
-            from numpy.lib.stride_tricks import sliding_window_view
-            windows = sliding_window_view(values, window_size)
-            return np.ascontiguousarray(windows)
-        except (ImportError, AttributeError):
-            pass
-        
-        windows = np.zeros((n_windows, window_size), dtype=values.dtype)
-        for i in range(n_windows):
-            windows[i] = values[i:i + window_size]
-        return windows
-
     def _detect_alarms(
         self, 
         scores: np.ndarray, 
@@ -2230,51 +2104,52 @@ class ARADLSTMDetector:
         List[Dict[str, Any]]
             List of alarm events
         """
-        alarms = []
-        in_alarm = False
-        alarm_start = None
-        alarm_scores = []
-        alarm_times = []
-        
+        # First pass: contiguous above-threshold segments only.
+        raw_alarms: List[Dict[str, Any]] = []
+        current_alarm: Optional[Dict[str, Any]] = None
+        first_valid_idx = self.sequence_length if self.target_mode == 'next' else (self.sequence_length - 1)
+
         for i, (score, t) in enumerate(zip(scores, timestamps)):
             # Skip initial spectra that can't be scored
-            if i < self.sequence_length - 1:
+            if i < first_valid_idx:
                 continue
-            
+
             if score > self.threshold:
-                if not in_alarm:
-                    in_alarm = True
-                    alarm_start = t
-                    alarm_scores = [score]
-                    alarm_times = [t]
+                if current_alarm is None:
+                    current_alarm = {
+                        'start_time': t,
+                        'end_time': t,
+                        'peak_score': score,
+                        'peak_time': t,
+                    }
                 else:
-                    alarm_scores.append(score)
-                    alarm_times.append(t)
+                    current_alarm['end_time'] = t
+                    if score > current_alarm['peak_score']:
+                        current_alarm['peak_score'] = score
+                        current_alarm['peak_time'] = t
+            elif current_alarm is not None:
+                raw_alarms.append(current_alarm)
+                current_alarm = None
+
+        if current_alarm is not None:
+            raw_alarms.append(current_alarm)
+
+        if not raw_alarms:
+            return []
+
+        # Second pass: merge nearby alarm segments separated by short gaps.
+        merged_alarms = [raw_alarms[0].copy()]
+        for alarm in raw_alarms[1:]:
+            prev = merged_alarms[-1]
+            if (alarm['start_time'] - prev['end_time']) < self.aggregation_gap:
+                prev['end_time'] = alarm['end_time']
+                if alarm['peak_score'] > prev['peak_score']:
+                    prev['peak_score'] = alarm['peak_score']
+                    prev['peak_time'] = alarm['peak_time']
             else:
-                if in_alarm:
-                    if i < len(timestamps) - 1 and (timestamps[i + 1] - alarm_times[-1]) < self.aggregation_gap:
-                        alarm_scores.append(score)
-                        alarm_times.append(t)
-                    else:
-                        peak_idx = np.argmax(alarm_scores)
-                        alarms.append({
-                            'start_time': alarm_start,
-                            'end_time': alarm_times[-1],
-                            'peak_score': alarm_scores[peak_idx],
-                            'peak_time': alarm_times[peak_idx]
-                        })
-                        in_alarm = False
-        
-        if in_alarm:
-            peak_idx = np.argmax(alarm_scores)
-            alarms.append({
-                'start_time': alarm_start,
-                'end_time': alarm_times[-1],
-                'peak_score': alarm_scores[peak_idx],
-                'peak_time': alarm_times[peak_idx]
-            })
-        
-        return alarms
+                merged_alarms.append(alarm.copy())
+
+        return merged_alarms
     
     def process_time_series(
         self, 
@@ -2326,18 +2201,20 @@ class ARADLSTMDetector:
         if not self.is_fitted_:
             raise RuntimeError("Detector must be fitted before setting threshold")
         
-        # Extract count rates and apply L1 normalization
+        # Convert to rates and apply L1 normalization
         counts = background_data.counts
         times = background_data.live_times
         if times is None or times.dtype == object or (hasattr(times, 'dtype') and times.dtype in [np.float32, np.float64] and np.any(np.isnan(times))):
             times = background_data.real_times
+        times = np.asarray(times, dtype=np.float64)
+        if np.any(~np.isfinite(times)) or np.any(times <= 0):
+            raise ValueError(
+                "Invalid live/real times found. All acquisition times must be finite and > 0."
+            )
         spectra = counts / times[:, np.newaxis]
         
-        # Gross count rate per spectrum (total counts/second) — before L1 norm
-        gross_count_rates = spectra.sum(axis=1)  # shape (n_spectra,)
-        
         # Apply L1 normalization to each spectrum
-        row_sums = gross_count_rates.copy()[:, np.newaxis]
+        row_sums = spectra.sum(axis=1, keepdims=True)
         row_sums = np.maximum(row_sums, 1e-10)
         spectra = spectra / row_sums
 
@@ -2347,36 +2224,47 @@ class ARADLSTMDetector:
             if n_windows > 0:
                 sequences = self._create_sliding_windows(spectra[:-1], self.sequence_length)
                 targets = spectra[self.sequence_length:]
-                cr_windows = self._create_sliding_windows_1d(
-                    gross_count_rates[:-1], self.sequence_length
-                )
                 scores = self.score_sequences_batch(
                     sequences, targets=targets,
-                    count_rates=cr_windows, batch_size=256,
+                    batch_size=256,
                 )
             else:
                 scores = np.array([])
-            total_time_seconds = np.sum(background_data.real_times[self.sequence_length:])
+            total_time_seconds = np.sum(times[self.sequence_length:])
         else:
             n_windows = len(spectra) - self.sequence_length + 1
             if n_windows > 0:
                 sequences = self._create_sliding_windows(spectra, self.sequence_length)
-                cr_windows = self._create_sliding_windows_1d(
-                    gross_count_rates, self.sequence_length
-                )
                 scores = self.score_sequences_batch(
                     sequences, targets=None,
-                    count_rates=cr_windows, batch_size=256,
+                    batch_size=256,
                 )
             else:
                 scores = np.array([])
-            total_time_seconds = np.sum(background_data.real_times[self.sequence_length - 1:])
+            total_time_seconds = np.sum(times[self.sequence_length - 1:])
         
+        if scores.size == 0:
+            min_required = self.sequence_length + 1 if self.target_mode == 'next' else self.sequence_length
+            raise ValueError(
+                f"Not enough spectra to calibrate threshold: got {len(spectra)}, need at least {min_required}."
+            )
+
         total_time_hours = total_time_seconds / 3600.0
         
         if total_time_hours <= 0:
             raise ValueError(f"Invalid observation time: {total_time_hours} hours")
         
+        # Build a full per-spectrum scores array for _detect_alarms.
+        # Scores are computed once; only alarm detection is repeated per threshold.
+        n_spectra = len(background_data.timestamps)
+        full_scores = np.zeros(n_spectra, dtype=np.float32)
+        if self.target_mode == 'next':
+            full_scores[self.sequence_length:] = scores
+        else:
+            full_scores[self.sequence_length - 1:] = scores
+
+        timestamps = background_data.timestamps
+
         # Binary search for threshold
         low_threshold = np.min(scores)
         high_threshold = np.max(scores) * 1.5
@@ -2393,8 +2281,8 @@ class ARADLSTMDetector:
             test_threshold = (low_threshold + high_threshold) / 2
             self.threshold = test_threshold
             
-            _ = self.process_time_series(background_data)
-            n_alarms = len(self.alarms)
+            alarms = self._detect_alarms(full_scores, timestamps)
+            n_alarms = len(alarms)
             observed_far = n_alarms / total_time_hours
             
             far_diff = abs(observed_far - alarms_per_hour)
@@ -2416,7 +2304,7 @@ class ARADLSTMDetector:
                 break
         
         self.threshold = best_threshold
-        self.process_time_series(background_data)
+        self.alarms = self._detect_alarms(full_scores, timestamps)
         final_far = len(self.alarms) / total_time_hours
         
         if self.verbose:
@@ -2441,8 +2329,6 @@ class ARADLSTMDetector:
             'bidirectional': self.bidirectional,
             'use_attention': self.use_attention,
             'num_attention_heads': self.num_attention_heads,
-            'use_count_rate': self.use_count_rate,
-            'count_rate_dim': self.count_rate_dim,
             'output_activation': self.output_activation,
             'use_arad_cnn': self.use_arad_cnn,
             'threshold': self.threshold,
@@ -2471,14 +2357,6 @@ class ARADLSTMDetector:
         self.bidirectional = checkpoint.get('bidirectional', False)
         self.use_attention = checkpoint.get('use_attention', True)
         self.num_attention_heads = checkpoint.get('num_attention_heads', 4)
-        # Default to True: new models always save this key; legacy checkpoints
-        # that lack it were most likely trained *with* count rates (the
-        # feature was added before the key was persisted).  Inspect the
-        # state dict as a fallback: if count_rate_proj weights exist the
-        # model was trained with count rates.
-        _has_cr_weights = any(k.startswith('count_rate_proj') for k in checkpoint['model_state'])
-        self.use_count_rate = checkpoint.get('use_count_rate', _has_cr_weights)
-        self.count_rate_dim = checkpoint.get('count_rate_dim', 8)
         self.output_activation = checkpoint.get('output_activation', 'sigmoid').lower()
         # Default ARAD-CNN path to True, but detect legacy checkpoints that
         # were saved before this flag existed and still use the old CNN/MLP stack.
@@ -2506,12 +2384,10 @@ class ARADLSTMDetector:
             bidirectional=self.bidirectional,
             use_attention=self.use_attention,
             num_attention_heads=self.num_attention_heads,
-            use_count_rate=self.use_count_rate,
-            count_rate_dim=self.count_rate_dim,
             output_activation=self.output_activation,
             use_arad_cnn=self.use_arad_cnn,
         ).to(self.device)
-        
+
         self.model_.load_state_dict(checkpoint['model_state'])
         self.is_fitted_ = True
         
@@ -2527,7 +2403,6 @@ class ARADLSTMDetector:
     def get_latent_representation(
         self,
         sequence: np.ndarray,
-        count_rates: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Get the latent representation of a spectrum sequence.
@@ -2536,9 +2411,6 @@ class ARADLSTMDetector:
         ----------
         sequence : np.ndarray
             Sequence of spectra, shape (sequence_length, n_bins)
-        count_rates : np.ndarray, optional
-            Gross count rates, shape (sequence_length,).
-        
         Returns
         -------
         np.ndarray
@@ -2548,20 +2420,15 @@ class ARADLSTMDetector:
             raise RuntimeError("Detector must be fitted first")
         
         x = torch.FloatTensor(sequence).unsqueeze(0).to(self.device)
-        cr_tensor = None
-        if count_rates is not None:
-            cr_tensor = torch.FloatTensor(count_rates).unsqueeze(0).to(self.device)
-        
         self.model_.eval()
         with torch.no_grad():
-            latent = self.model_.encode(x, count_rates=cr_tensor)
+            latent = self.model_.encode(x)
         
         return latent.cpu().numpy().squeeze()
     
     def reconstruct_spectrum(
         self, 
         sequence: np.ndarray,
-        count_rates: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Predict / reconstruct a spectrum from a sequence of input spectra.
@@ -2579,9 +2446,6 @@ class ARADLSTMDetector:
         ----------
         sequence : np.ndarray
             Sequence of spectra, shape (sequence_length, n_bins)
-        count_rates : np.ndarray, optional
-            Gross count rates, shape (sequence_length,).
-        
         Returns
         -------
         np.ndarray
@@ -2596,13 +2460,10 @@ class ARADLSTMDetector:
         row_sums = np.where(row_sums == 0, 1.0, row_sums)
         x_normalized = sequence / row_sums
         x = torch.FloatTensor(x_normalized).unsqueeze(0).to(self.device)
-        cr_tensor = None
-        if count_rates is not None:
-            cr_tensor = torch.FloatTensor(count_rates).unsqueeze(0).to(self.device)
-        
+
         self.model_.eval()
         with torch.no_grad():
-            reconstructed = self.model_(x, count_rates=cr_tensor)
+            reconstructed = self.model_(x)
         
         return reconstructed.cpu().numpy().squeeze()
     
@@ -2610,7 +2471,6 @@ class ARADLSTMDetector:
         self, 
         sequence: np.ndarray,
         target: Optional[np.ndarray] = None,
-        count_rates: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Get per-bin reconstruction error for anomaly localization.
@@ -2635,9 +2495,6 @@ class ARADLSTMDetector:
             The actual next spectrum, shape (n_bins,).
             Required for target_mode='next'.
             Ignored for target_mode='last'.
-        count_rates : np.ndarray, optional
-            Gross count rates, shape (sequence_length,).
-        
         Returns
         -------
         np.ndarray
@@ -2662,10 +2519,7 @@ class ARADLSTMDetector:
         row_sums = np.where(row_sums == 0, 1.0, row_sums)
         x_normalized = sequence / row_sums
         x = torch.FloatTensor(x_normalized).unsqueeze(0).to(self.device)
-        cr_tensor = None
-        if count_rates is not None:
-            cr_tensor = torch.FloatTensor(count_rates).unsqueeze(0).to(self.device)
-        
+
         # L1-normalize the reference spectrum
         ref_sum = reference.sum()
         if ref_sum == 0:
@@ -2674,7 +2528,7 @@ class ARADLSTMDetector:
         
         self.model_.eval()
         with torch.no_grad():
-            reconstructed = self.model_(x, count_rates=cr_tensor)
+            reconstructed = self.model_(x)
         
         # Get reconstructed normalized values
         recon_norm = reconstructed.cpu().numpy().squeeze()
