@@ -41,7 +41,6 @@ from typing import Optional, List, Tuple, Dict, Any, Union
 import warnings
 from pathlib import Path
 import math
-import json
 
 try:
     import torch
@@ -60,6 +59,20 @@ except ImportError:
 from gammaflow.core.time_series import SpectralTimeSeries
 from gammaflow.core.spectrum import Spectrum
 from src.detectors.arad import ARADEncoderBlock, ARADDecoderBlock
+
+
+SUPPORTED_TARGET_MODE = 'next'
+
+
+def _require_next_target_mode(target_mode: str, context: str) -> str:
+    """Ensure scores always compare predicted next spectra to actual next spectra."""
+    normalized_target_mode = str(target_mode).lower()
+    if normalized_target_mode != SUPPORTED_TARGET_MODE:
+        raise ValueError(
+            f"{context} only supports target_mode='{SUPPORTED_TARGET_MODE}', got '{target_mode}'. "
+            "Scores must be based on the predicted next spectrum versus the actual next spectrum received."
+        )
+    return normalized_target_mode
 
 
 # =============================================================================
@@ -166,7 +179,7 @@ class PreprocessedRunDataset(Dataset):
         self.run_ids = run_ids
         self.sequence_length = sequence_length
         self.augmentation = augmentation
-        self.target_mode = target_mode
+        self.target_mode = _require_next_target_mode(target_mode, "PreprocessedRunDataset")
         self.cache_size_runs = cache_size_runs
 
         from collections import OrderedDict
@@ -975,10 +988,8 @@ class ARADLSTMDetector:
     use_augmentation : bool, default=False
         Whether to use data augmentation during training
     target_mode : str, default='next'
-        Target mode: 'next' (predict next spectrum after sequence) or
-        'last' (reconstruct last spectrum in sequence).
-        'next' is recommended for anomaly detection as it compares
-        predicted vs actual next spectrum.
+        Target mode. Only 'next' is supported: predict the next spectrum
+        after the sequence and score against the actual next spectrum.
     output_activation : str, default='softmax'
         Output activation for decoder: 'softmax' or 'sigmoid'.
         'softmax' is recommended for L1-normalized data because it produces
@@ -1054,7 +1065,7 @@ class ARADLSTMDetector:
         self.loss_type = loss_type.lower()
         self.gradient_clip = gradient_clip
         self.use_augmentation = use_augmentation
-        self.target_mode = target_mode
+        self.target_mode = _require_next_target_mode(target_mode, "ARADLSTMDetector")
         self.output_activation = output_activation.lower()
         self.use_arad_cnn = use_arad_cnn
         self.verbose = verbose
@@ -1365,6 +1376,9 @@ class ARADLSTMDetector:
         patience_counter = 0
         
         self.training_history_ = {
+            'train_total_loss': [],
+            'train_recon_loss': [],
+            'val_recon_loss': [],
             'train_loss': [],
             'val_loss': [],
             'learning_rates': []
@@ -1388,7 +1402,8 @@ class ARADLSTMDetector:
         for epoch in range(self.epochs):
             # Training phase
             self.model_.train()
-            train_losses = []
+            train_total_losses = []
+            train_recon_losses = []
             
             for batch in train_loader:
                 batch_x, batch_target = batch[0], batch[1]
@@ -1407,11 +1422,13 @@ class ARADLSTMDetector:
                         reconstructed_norm = self._normalize_spectrum(reconstructed)
                         
                         if self.loss_type == 'jsd':
-                            loss = self._jsd_loss(target_norm, reconstructed_norm)
+                            recon_loss = self._jsd_loss(target_norm, reconstructed_norm)
                         elif self.loss_type == 'chi2':
-                            loss = self._chi2_loss(target_norm, reconstructed_norm)
+                            recon_loss = self._chi2_loss(target_norm, reconstructed_norm)
                         else:
-                            loss = self._mse_loss(target_norm, reconstructed_norm)
+                            recon_loss = self._mse_loss(target_norm, reconstructed_norm)
+                        
+                        loss = recon_loss
                         
                         if self.l1_lambda > 0:
                             l1_reg = sum(p.abs().sum() for p in self.model_.parameters())
@@ -1434,11 +1451,13 @@ class ARADLSTMDetector:
                     reconstructed_norm = self._normalize_spectrum(reconstructed)
                     
                     if self.loss_type == 'jsd':
-                        loss = self._jsd_loss(target_norm, reconstructed_norm)
+                        recon_loss = self._jsd_loss(target_norm, reconstructed_norm)
                     elif self.loss_type == 'chi2':
-                        loss = self._chi2_loss(target_norm, reconstructed_norm)
+                        recon_loss = self._chi2_loss(target_norm, reconstructed_norm)
                     else:
-                        loss = self._mse_loss(target_norm, reconstructed_norm)
+                        recon_loss = self._mse_loss(target_norm, reconstructed_norm)
+                    
+                    loss = recon_loss
                     
                     if self.l1_lambda > 0:
                         l1_reg = sum(p.abs().sum() for p in self.model_.parameters())
@@ -1451,13 +1470,15 @@ class ARADLSTMDetector:
                     
                     optimizer.step()
                 
-                train_losses.append(loss.item())
+                train_total_losses.append(loss.item())
+                train_recon_losses.append(recon_loss.item())
             
-            avg_train_loss = np.mean(train_losses)
+            avg_train_total_loss = float(np.mean(train_total_losses))
+            avg_train_recon_loss = float(np.mean(train_recon_losses))
             
             # Validation phase
             self.model_.eval()
-            val_losses = []
+            val_recon_losses = []
             
             with torch.no_grad():
                 for batch in val_loader:
@@ -1472,34 +1493,37 @@ class ARADLSTMDetector:
                             reconstructed_norm = self._normalize_spectrum(reconstructed)
                             
                             if self.loss_type == 'jsd':
-                                loss = self._jsd_loss(target_norm, reconstructed_norm)
+                                recon_loss = self._jsd_loss(target_norm, reconstructed_norm)
                             elif self.loss_type == 'chi2':
-                                loss = self._chi2_loss(target_norm, reconstructed_norm)
+                                recon_loss = self._chi2_loss(target_norm, reconstructed_norm)
                             else:
-                                loss = self._mse_loss(target_norm, reconstructed_norm)
+                                recon_loss = self._mse_loss(target_norm, reconstructed_norm)
                     else:
                         reconstructed = compiled_model(batch_x)
                         target_norm = self._normalize_spectrum(batch_target)
                         reconstructed_norm = self._normalize_spectrum(reconstructed)
                         
                         if self.loss_type == 'jsd':
-                            loss = self._jsd_loss(target_norm, reconstructed_norm)
+                            recon_loss = self._jsd_loss(target_norm, reconstructed_norm)
                         elif self.loss_type == 'chi2':
-                            loss = self._chi2_loss(target_norm, reconstructed_norm)
+                            recon_loss = self._chi2_loss(target_norm, reconstructed_norm)
                         else:
-                            loss = self._mse_loss(target_norm, reconstructed_norm)
+                            recon_loss = self._mse_loss(target_norm, reconstructed_norm)
                     
-                    val_losses.append(loss.item())
+                    val_recon_losses.append(recon_loss.item())
             
-            avg_val_loss = np.mean(val_losses)
-            scheduler.step(avg_val_loss)
+            avg_val_recon_loss = float(np.mean(val_recon_losses))
+            scheduler.step(avg_val_recon_loss)
             
-            self.training_history_['train_loss'].append(avg_train_loss)
-            self.training_history_['val_loss'].append(avg_val_loss)
+            self.training_history_['train_total_loss'].append(avg_train_total_loss)
+            self.training_history_['train_recon_loss'].append(avg_train_recon_loss)
+            self.training_history_['val_recon_loss'].append(avg_val_recon_loss)
+            self.training_history_['train_loss'].append(avg_train_recon_loss)
+            self.training_history_['val_loss'].append(avg_val_recon_loss)
             self.training_history_['learning_rates'].append(optimizer.param_groups[0]['lr'])
             
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
+            if avg_val_recon_loss < best_val_loss:
+                best_val_loss = avg_val_recon_loss
                 best_model_state = {k: v.cpu().clone() for k, v in self.model_.state_dict().items()}
                 patience_counter = 0
             else:
@@ -1507,7 +1531,9 @@ class ARADLSTMDetector:
             
             if self.verbose:
                 print(f"Epoch {epoch + 1}/{self.epochs} - "
-                      f"Train: {avg_train_loss:.4f}, Val: {avg_val_loss:.4f}, "
+                      f"Train Total: {avg_train_total_loss:.4f}, "
+                      f"Train Recon: {avg_train_recon_loss:.4f}, "
+                      f"Val Recon: {avg_val_recon_loss:.4f}, "
                       f"LR: {optimizer.param_groups[0]['lr']:.2e}")
             
             if patience_counter >= self.early_stopping_patience:
@@ -1627,17 +1653,13 @@ class ARADLSTMDetector:
         """
         Score a sequence by comparing model prediction to target spectrum.
         
-        For target_mode='next': predicts next spectrum, compares to provided target.
-        For target_mode='last': reconstructs last spectrum in sequence.
-        
         Parameters
         ----------
         sequence : np.ndarray
             Sequence of spectra, shape (sequence_length, n_bins)
         target : np.ndarray, optional
             The actual target spectrum to compare against.
-            Required for target_mode='next' (the actual next spectrum).
-            For target_mode='last', this is ignored and sequence[-1] is used.
+            Required: this must be the actual next spectrum received.
         Returns
         -------
         float
@@ -1707,8 +1729,8 @@ class ARADLSTMDetector:
             Array of sequences, shape (n_sequences, sequence_length, n_bins)
         targets : np.ndarray, optional
             Array of target spectra, shape (n_sequences, n_bins).
-            Required for target_mode='next' (the actual next spectra).
-            For target_mode='last', ignored and sequences[:, -1, :] is used.
+            Required: these must be the actual next spectra received after
+            each input sequence.
         batch_size : int
             Number of sequences to process in each batch. Larger batches are
             more efficient but use more GPU memory. Default 256.
@@ -1862,17 +1884,10 @@ class ARADLSTMDetector:
         
         Maintains an internal buffer of recent spectra for streaming use.
         Spectra should be added in chronological order.
-        
-        For target_mode='next' (default):
-            The buffer holds sequence_length + 1 spectra.  The first L
-            spectra are the context (input to the model) and the most
-            recent spectrum is the *target* — the model predicts what it
-            thinks the next spectrum should look like, and the anomaly
-            score is how far the prediction is from what actually arrived.
-        
-        For target_mode='last':
-            The buffer holds sequence_length spectra.  The model
-            reconstructs the last spectrum in the window.
+        The buffer holds sequence_length + 1 spectra. The first L spectra
+        are the temporal context and the most recent spectrum is the actual
+        next spectrum received. The anomaly score is the difference between
+        the model's predicted next spectrum and that real next spectrum.
         
         Parameters
         ----------
@@ -2150,6 +2165,71 @@ class ARADLSTMDetector:
                 merged_alarms.append(alarm.copy())
 
         return merged_alarms
+
+    @staticmethod
+    def _compute_unique_window_coverage_seconds(
+        timestamps: np.ndarray,
+        acquisition_times: np.ndarray,
+        first_valid_idx: int,
+    ) -> float:
+        """Compute unique covered time for scored windows.
+
+        This avoids double-counting observation time when integrations overlap.
+        """
+        if len(timestamps) <= first_valid_idx or len(acquisition_times) <= first_valid_idx:
+            return 0.0
+
+        valid_timestamps = np.asarray(timestamps[first_valid_idx:], dtype=np.float64)
+        valid_times = np.asarray(acquisition_times[first_valid_idx:], dtype=np.float64)
+        if valid_timestamps.size == 0 or valid_times.size == 0:
+            return 0.0
+
+        starts = valid_timestamps - 0.5 * valid_times
+        ends = valid_timestamps + 0.5 * valid_times
+
+        total = 0.0
+        current_start = float(starts[0])
+        current_end = float(ends[0])
+        for start, end in zip(starts[1:], ends[1:]):
+            start = float(start)
+            end = float(end)
+            if start <= current_end:
+                current_end = max(current_end, end)
+            else:
+                total += max(0.0, current_end - current_start)
+                current_start = start
+                current_end = end
+
+        total += max(0.0, current_end - current_start)
+        return total
+
+    @staticmethod
+    def _estimate_initial_threshold_percentile(
+        n_scores: int,
+        total_time_hours: float,
+        alarms_per_hour: float,
+    ) -> float:
+        """Estimate a threshold seed percentile from the scored-window rate.
+
+        The previous implementation implicitly treated the number of scored
+        windows as if it were the number of elapsed minutes, which badly
+        underestimates the starting percentile for higher-rate streams.
+        """
+        if n_scores <= 0:
+            raise ValueError("n_scores must be positive")
+        if total_time_hours <= 0:
+            raise ValueError("total_time_hours must be positive")
+        if alarms_per_hour < 0:
+            raise ValueError("alarms_per_hour must be non-negative")
+
+        scored_windows_per_hour = n_scores / total_time_hours
+        if scored_windows_per_hour <= 0:
+            raise ValueError("scored_windows_per_hour must be positive")
+
+        target_exceedance_rate = alarms_per_hour / scored_windows_per_hour
+        percentile = 100.0 * (1.0 - target_exceedance_rate)
+        upper_bound = float(np.nextafter(np.float64(100.0), np.float64(0.0)))
+        return float(np.clip(percentile, 0.0, upper_bound))
     
     def process_time_series(
         self, 
@@ -2230,7 +2310,6 @@ class ARADLSTMDetector:
                 )
             else:
                 scores = np.array([])
-            total_time_seconds = np.sum(times[self.sequence_length:])
         else:
             n_windows = len(spectra) - self.sequence_length + 1
             if n_windows > 0:
@@ -2241,13 +2320,19 @@ class ARADLSTMDetector:
                 )
             else:
                 scores = np.array([])
-            total_time_seconds = np.sum(times[self.sequence_length - 1:])
-        
+
         if scores.size == 0:
             min_required = self.sequence_length + 1 if self.target_mode == 'next' else self.sequence_length
             raise ValueError(
                 f"Not enough spectra to calibrate threshold: got {len(spectra)}, need at least {min_required}."
             )
+
+        first_valid_idx = self.sequence_length if self.target_mode == 'next' else (self.sequence_length - 1)
+        total_time_seconds = self._compute_unique_window_coverage_seconds(
+            timestamps=np.asarray(background_data.timestamps, dtype=np.float64),
+            acquisition_times=times,
+            first_valid_idx=first_valid_idx,
+        )
 
         total_time_hours = total_time_seconds / 3600.0
         
@@ -2265,17 +2350,27 @@ class ARADLSTMDetector:
 
         timestamps = background_data.timestamps
 
-        # Binary search for threshold
+        # Binary search for threshold.
+        # Mirror the original ARAD detector's behavior so FAR calibration is
+        # stable even when alarm counts are quantized by segment aggregation.
+        initial_percentile = self._estimate_initial_threshold_percentile(
+            n_scores=len(scores),
+            total_time_hours=total_time_hours,
+            alarms_per_hour=alarms_per_hour,
+        )
         low_threshold = np.min(scores)
         high_threshold = np.max(scores) * 1.5
-        
-        best_threshold = float(np.median(scores))
+
+        best_threshold = float(np.percentile(scores, initial_percentile))
         best_far_diff = float('inf')
+        best_observed_far = 0.0
         
         if self.verbose:
             print(f"\nCalibrating threshold for {alarms_per_hour:.2f} alarms/hour...")
+            print(f"  Background data: {len(scores)} scored windows over {total_time_hours:.2f} hours")
             print(f"  Score range: [{scores.min():.4f}, {scores.max():.4f}]")
-            print(f"  Observation time: {total_time_hours:.2f} hours")
+            print(f"  Score mean ± std: {scores.mean():.4f} ± {scores.std():.4f}")
+            print(f"  Starting binary search...")
         
         for iteration in range(max_iterations):
             test_threshold = (low_threshold + high_threshold) / 2
@@ -2286,10 +2381,20 @@ class ARADLSTMDetector:
             observed_far = n_alarms / total_time_hours
             
             far_diff = abs(observed_far - alarms_per_hour)
-            
+
+            is_better = False
             if far_diff < best_far_diff:
+                is_better = True
+            elif far_diff == best_far_diff:
+                if observed_far > best_observed_far:
+                    is_better = True
+                elif observed_far == best_observed_far:
+                    is_better = test_threshold < best_threshold
+
+            if is_better:
                 best_far_diff = far_diff
                 best_threshold = test_threshold
+                best_observed_far = observed_far
             
             if self.verbose:
                 print(f"  Iter {iteration + 1}: threshold={test_threshold:.4f}, "
@@ -2300,7 +2405,9 @@ class ARADLSTMDetector:
             else:
                 high_threshold = test_threshold
             
-            if far_diff < 0.01:
+            if far_diff < max(0.1 * alarms_per_hour, 1e-6) or (high_threshold - low_threshold) < 1e-8:
+                if self.verbose:
+                    print(f"  Converged after {iteration + 1} iterations")
                 break
         
         self.threshold = best_threshold
@@ -2308,8 +2415,9 @@ class ARADLSTMDetector:
         final_far = len(self.alarms) / total_time_hours
         
         if self.verbose:
-            print(f"\nFinal threshold: {self.threshold:.4f}")
-            print(f"Achieved FAR: {final_far:.2f} alarms/hour")
+            print(f"\nFinal threshold: {self.threshold:.6f}")
+            print(f"Achieved FAR: {final_far:.2f} alarms/hour ({len(self.alarms)} alarms)")
+            print(f"Target FAR: {alarms_per_hour:.2f} alarms/hour")
         
         return self.threshold
     
@@ -2372,7 +2480,10 @@ class ARADLSTMDetector:
         self.use_arad_cnn = checkpoint.get('use_arad_cnn', not _has_legacy_modules)
         self.threshold = checkpoint['threshold']
         self.loss_type = checkpoint['loss_type']
-        self.target_mode = checkpoint.get('target_mode', 'next')
+        self.target_mode = _require_next_target_mode(
+            checkpoint.get('target_mode', SUPPORTED_TARGET_MODE),
+            "Loaded checkpoint"
+        )
         self.training_history_ = checkpoint['training_history']
         
         self.model_ = TemporalLSTMAutoencoder(
@@ -2431,16 +2542,7 @@ class ARADLSTMDetector:
         sequence: np.ndarray,
     ) -> np.ndarray:
         """
-        Predict / reconstruct a spectrum from a sequence of input spectra.
-        
-        For target_mode='next' (default):
-            Returns the model's *prediction* of the spectrum that should
-            follow the input sequence.  Compare this to the actual next
-            spectrum to obtain an anomaly score.
-        
-        For target_mode='last':
-            Returns the model's reconstruction of the last spectrum in
-            the input sequence.
+        Predict the next spectrum from a sequence of input spectra.
         
         Parameters
         ----------
@@ -2449,8 +2551,7 @@ class ARADLSTMDetector:
         Returns
         -------
         np.ndarray
-            Predicted (next) or reconstructed (last) L1-normalized
-            spectrum, shape (n_bins,).
+            Predicted next L1-normalized spectrum, shape (n_bins,).
         """
         if not self.is_fitted_:
             raise RuntimeError("Detector must be fitted first")
@@ -2478,14 +2579,9 @@ class ARADLSTMDetector:
         Useful for identifying which energy bins contribute most to the
         anomaly score, potentially revealing the isotope signature.
         
-        For target_mode='next':
-            The model predicts the spectrum that *follows* the input
-            sequence.  Pass the actual next spectrum as ``target`` so
-            the error map shows where prediction differs from reality.
-        
-        For target_mode='last':
-            The model reconstructs the last spectrum in the sequence.
-            ``target`` is ignored; ``sequence[-1]`` is used.
+        The model predicts the spectrum that follows the input sequence.
+        Pass the actual next spectrum as ``target`` so the error map
+        shows where prediction differs from reality.
         
         Parameters
         ----------
@@ -2493,8 +2589,7 @@ class ARADLSTMDetector:
             Sequence of spectra, shape (sequence_length, n_bins)
         target : np.ndarray, optional
             The actual next spectrum, shape (n_bins,).
-            Required for target_mode='next'.
-            Ignored for target_mode='last'.
+            Required.
         Returns
         -------
         np.ndarray
@@ -2503,16 +2598,11 @@ class ARADLSTMDetector:
         if not self.is_fitted_:
             raise RuntimeError("Detector must be fitted first")
         
-        # Determine reference spectrum based on target_mode
-        if self.target_mode == 'next':
-            if target is None:
-                raise ValueError(
-                    "target must be provided for target_mode='next'. "
-                    "Pass the actual next spectrum to compare against."
-                )
-            reference = target
-        else:
-            reference = sequence[-1]
+        if target is None:
+            raise ValueError(
+                "target must be provided. Pass the actual next spectrum to compare against."
+            )
+        reference = target
         
         # Apply L1 normalization to input sequence
         row_sums = sequence.sum(axis=1, keepdims=True)

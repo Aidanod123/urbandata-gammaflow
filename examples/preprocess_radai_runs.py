@@ -56,6 +56,24 @@ if str(ROOT) not in sys.path:
 from src.detectors.arad_lstm import ARADLSTMDetector
 
 
+def resolve_output_dir(output_dir_arg: str) -> Path:
+    """Resolve and create the output directory with actionable error messages."""
+    output_dir = Path(output_dir_arg).expanduser()
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except PermissionError as exc:
+        hint = ""
+        if output_dir.is_absolute() and len(output_dir.parts) > 1 and output_dir.parts[1].startswith("per-"):
+            hint = (
+                "\nHint: this path is absolute and points at the filesystem root. "
+                "If you meant a repo-relative folder, remove the leading '/'."
+            )
+        raise PermissionError(
+            f"Cannot create output directory '{output_dir}'. {exc}.{hint}"
+        ) from exc
+    return output_dir
+
+
 def get_all_run_ids(h5_path: Path) -> List[int]:
     """Get all run IDs from an HDF5 file."""
     with h5py.File(h5_path, "r") as f:
@@ -381,7 +399,7 @@ def main():
     parser = argparse.ArgumentParser(description="Preprocess RADAI runs into tensors")
     parser.add_argument("--h5-path", type=str, required=True, help="Path to RADAI HDF5 file")
     parser.add_argument("--output-dir", type=str, default=str(ROOT / "RADAI-preprocessed"),
-                        help="Output directory for .pt tensors (default: RADAI-preprocessed)")
+                        help="Output directory for .pt tensors; created if needed (default: RADAI-preprocessed)")
     parser.add_argument("--integration-time", type=float, default=1.0, help="Integration time per spectrum (s)")
     parser.add_argument("--stride-time", type=float, default=1.0, help="Stride between spectra (s)")
     parser.add_argument("--energy-bins", type=int, default=128, help="Number of energy bins")
@@ -399,8 +417,7 @@ def main():
     args = parser.parse_args()
 
     h5_path = Path(args.h5_path)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = resolve_output_dir(args.output_dir)
 
     energy_range = (args.energy_min, args.energy_max)
 
@@ -410,6 +427,7 @@ def main():
 
     print(f"Processing {len(run_ids)} runs from {h5_path}")
     print(f"Normalization: per-spectrum-l1")
+    print(f"Output directory: {output_dir}")
 
     total_spectra = 0
     wall_start = _time.perf_counter()

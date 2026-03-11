@@ -106,8 +106,10 @@ def select_training_runs(
 def plot_training_history(history: dict, save_path: Path):
     """Plot training and validation loss curves."""
     plt.figure(figsize=(10, 5))
-    plt.plot(history['train_loss'], label='Training Loss', linewidth=2)
-    plt.plot(history['val_loss'], label='Validation Loss', linewidth=2)
+    plt.plot(history['train_loss'], label='Training Recon Loss', linewidth=2)
+    plt.plot(history['val_loss'], label='Validation Recon Loss', linewidth=2)
+    if 'train_total_loss' in history:
+        plt.plot(history['train_total_loss'], label='Training Total Loss', linewidth=1.5, linestyle='--')
     plt.xlabel('Epoch', fontsize=12)
     plt.ylabel('Loss', fontsize=12)
     plt.title('ARAD-LSTM Training History', fontsize=14, fontweight='bold')
